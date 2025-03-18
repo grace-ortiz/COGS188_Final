@@ -2,102 +2,151 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-from collections import deque
 import random
+from collections import deque
+import gymnasium as gym
+from webots_env import WebotsCarEnv
 
-# Define the Q-Network
-class QNetwork(nn.Module):
-    def __init__(self, state_dim, action_dim):
-        super(QNetwork, self).__init__()
-        self.fc1 = nn.Linear(state_dim, 64)
-        self.fc2 = nn.Linear(64, 64)
-        self.fc3 = nn.Linear(64, action_dim)
+# Hyperparameters
+GAMMA = 0.99        # Discount factor
+LR = 0.001          # Learning rate
+BATCH_SIZE = 64     # Batch size for experience replay
+MEMORY_SIZE = 10000 # Replay memory size
+EPSILON_START = 1.0 # Initial exploration rate
+EPSILON_MIN = 0.05  # Minimum exploration rate
+EPSILON_DECAY = 0.995 # Decay rate
+TARGET_UPDATE = 10  # Target network update frequency
 
-    def forward(self, state):
-        x = torch.relu(self.fc1(state))
+
+class DQN(nn.Module):
+    """Neural network model for Q-learning."""
+    def __init__(self, input_dim, output_dim):
+        super(DQN, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 128)
+        self.fc2 = nn.Linear(128, 128)
+        self.fc3 = nn.Linear(128, output_dim)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
         x = torch.relu(self.fc2(x))
-        return self.fc3(x)
+        return self.fc3(x)  # Output Q-values
 
-# Define the DQN Agent
+
 class DQNAgent:
-    def __init__(self, env, alpha=0.001, gamma=0.99, epsilon=1.0, epsilon_decay=0.995, epsilon_min=0.01):
-        self.env = env
-        self.alpha = alpha
-        self.gamma = gamma
-        self.epsilon = epsilon
-        self.epsilon_decay = epsilon_decay
-        self.epsilon_min = epsilon_min
-        self.memory = deque(maxlen=10000)
-        
-        # State and action dimensions
-        self.state_dim = self._get_state_dim()
-        self.action_dim = 5  # Example: 5 discrete actions (e.g., combinations of steering and speed)
-        
-        # Neural network for DQN
-        self.model = QNetwork(self.state_dim, self.action_dim)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=alpha)
+    """DQN agent with experience replay."""
+    def __init__(self, state_dim, action_dim):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.memory = deque(maxlen=MEMORY_SIZE)
+        self.epsilon = EPSILON_START
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.policy_net = DQN(state_dim, action_dim).to(self.device)
+        self.target_net = DQN(state_dim, action_dim).to(self.device)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.target_net.eval()
+
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=LR)
         self.loss_fn = nn.MSELoss()
 
-    def _get_state_dim(self):
-        # Flatten the state dictionary into a single vector
-        state = self.env.reset()
-        return sum(np.prod(v.shape) for v in state.values())
-
-    def _flatten_state(self, state):
-        # Flatten the state dictionary into a single vector
-        return np.concatenate([v.flatten() for v in state.values()])
-
-    def choose_action(self, state):
+    def select_action(self, state):
+        """Selects an action using ε-greedy policy."""
         if np.random.rand() < self.epsilon:
-            return self.env.action_space.sample()
+            return np.random.uniform([-0.5, 0.0], [0.5, 250.0])  # Random action in range
         else:
-            state_tensor = torch.FloatTensor(self._flatten_state(state))
-            q_values = self.model(state_tensor)
-            return torch.argmax(q_values).item()
+            state_tensor = torch.tensor(state, dtype=torch.float32).to(self.device).unsqueeze(0)
+            with torch.no_grad():
+                q_values = self.policy_net(state_tensor)
+            return q_values.cpu().numpy()[0]
 
-    def remember(self, state, action, reward, next_state, done):
+    def store_experience(self, state, action, reward, next_state, done):
+        """Stores experience in memory."""
         self.memory.append((state, action, reward, next_state, done))
 
-    def replay(self, batch_size):
-        if len(self.memory) < batch_size:
+    def train(self):
+        """Trains the DQN using experience replay."""
+        if len(self.memory) < BATCH_SIZE:
             return
-        minibatch = random.sample(self.memory, batch_size)
-        states = torch.FloatTensor([self._flatten_state(i[0]) for i in minibatch])
-        actions = torch.LongTensor([i[1] for i in minibatch])
-        rewards = torch.FloatTensor([i[2] for i in minibatch])
-        next_states = torch.FloatTensor([self._flatten_state(i[3]) for i in minibatch])
-        dones = torch.FloatTensor([i[4] for i in minibatch])
 
-        current_q = self.model(states).gather(1, actions.unsqueeze(1))
-        next_q = self.model(next_states).max(1)[0].detach()
-        target_q = rewards + (1 - dones) * self.gamma * next_q
+        batch = random.sample(self.memory, BATCH_SIZE)
+        states, actions, rewards, next_states, dones = zip(*batch)
 
-        loss = self.loss_fn(current_q.squeeze(), target_q)
+        states = torch.tensor(np.array(states), dtype=torch.float32).to(self.device)
+        actions = torch.tensor(np.array(actions), dtype=torch.float32).to(self.device)
+        rewards = torch.tensor(np.array(rewards), dtype=torch.float32).to(self.device)
+        next_states = torch.tensor(np.array(next_states), dtype=torch.float32).to(self.device)
+        dones = torch.tensor(np.array(dones), dtype=torch.float32).to(self.device)
+
+        # Compute current Q-values
+        current_q_values = self.policy_net(states)
+
+        # Compute target Q-values
+        with torch.no_grad():
+            next_q_values = self.target_net(next_states).max(1)[0]
+            target_q_values = rewards + GAMMA * next_q_values * (1 - dones)
+
+        loss = self.loss_fn(current_q_values.squeeze(), target_q_values.unsqueeze(1))
+
+        # Backpropagation
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
+    def update_target_network(self):
+        """Updates target network with policy network weights."""
+        self.target_net.load_state_dict(self.policy_net.state_dict())
 
-    def train(self, episodes=500):
-        for episode in range(episodes):
-            state = self.env.reset()
-            total_reward = 0
-            done = False
+    def decay_epsilon(self):
+        """Decay exploration rate ε."""
+        self.epsilon = max(EPSILON_MIN, self.epsilon * EPSILON_DECAY)
 
-            while not done:
-                action = self.choose_action(state)
-                next_state, reward, done = self.env.step(action)
-                self.remember(state, action, reward, next_state, done)
-                state = next_state
-                total_reward += reward
 
-                self.replay(batch_size=32)
+def flatten_state(state):
+    """Flattens dictionary state representation to a 1D array."""
+    return np.concatenate([
+        state["speed"], 
+        state["gps"], 
+        state["lidar_dist"], 
+        state["lidar_angle"], 
+        state["lane_deviation"]
+    ]).astype(np.float32)
 
-            print(f"Episode {episode+1}, Total Reward: {total_reward}")
 
-# Initialize environment and agent
-env = WebotsCarEnv()
-dqn_agent = DQNAgent(env)
-dqn_agent.train()
+def train_dqn():
+    """Main training loop for DQN."""
+    env = WebotsCarEnv()
+    state_dim = 6  # Speed (1), GPS (2), LiDAR dist (1), LiDAR angle (1), Lane deviation (1)
+    action_dim = 2  # Steering angle, speed
+
+    agent = DQNAgent(state_dim, action_dim)
+
+    num_episodes = 1000
+    for episode in range(num_episodes):
+        state = flatten_state(env.reset())
+        total_reward = 0
+
+        for t in range(500):
+            action = agent.select_action(state)
+            next_state, reward, done = env.step(action)
+            next_state = flatten_state(next_state)
+
+            agent.store_experience(state, action, reward, next_state, done)
+            agent.train()
+            total_reward += reward
+
+            state = next_state
+            if done:
+                break
+
+        agent.decay_epsilon()
+
+        if episode % TARGET_UPDATE == 0:
+            agent.update_target_network()
+
+        print(f"Episode {episode}, Total Reward: {total_reward}, Epsilon: {agent.epsilon}")
+
+    env.close()
+
+
+if __name__ == "__main__":
+    train_dqn()
