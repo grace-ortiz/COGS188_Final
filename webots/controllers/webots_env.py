@@ -170,8 +170,8 @@ class WebotsCarEnv(gym.Env):
             reward -= 20
         elif self.gps_speed >= CITY_SPEED_LIMIT:  # Penalty for speeding
             reward -= 10  
-        elif self.gps_speed < 5:  # Penalty for stalling
-            reward -= 30
+        elif self.gps_speed < 3:  # Penalty for stalling
+            reward -= 70
         
         reward += self.gps_speed *.5  # speed progress reward
         
