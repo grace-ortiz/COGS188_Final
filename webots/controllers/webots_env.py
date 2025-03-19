@@ -199,10 +199,10 @@ class WebotsCarEnv(gym.Env):
             print("Goal reached.")
             return True
 
-        current_time = self.agent.getTime()
-        if current_time >= MAX_SIM_TIME:
-            print("Time limit reached.")
-            return True
+        #current_time = self.agent.getTime()
+        #if current_time >= MAX_SIM_TIME:
+        #    print("Time limit reached.")
+         #   return True
             
         return False  # Explicitly return False when not done
     
