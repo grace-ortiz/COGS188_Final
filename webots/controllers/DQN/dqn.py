@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -7,22 +8,27 @@ import os
 import sys
 import matplotlib.pyplot as plt
 from collections import deque
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
 from webots_env import WebotsCarEnv
 
 # Hyperparameters
-GAMMA = 0.99        # Discount factor
-LR = 0.001          # Learning rate
-BATCH_SIZE = 64     # Batch size for experience replay
-MEMORY_SIZE = 10000 # Replay memory size
-EPSILON_START = 1.0 # Initial exploration rate
-EPSILON_MIN = 0.05  # Minimum exploration rate
-EPSILON_DECAY = 0.995 # Decay rate
-TARGET_UPDATE = 10  # Target network update frequency
+GAMMA = 0.99
+LR = 0.0001          # Lower LR for stability
+BATCH_SIZE = 64
+MEMORY_SIZE = 100000
+EPSILON_START = 1.0
+EPSILON_MIN = 0.02
+EPSILON_DECAY = 0.997  # Decay faster so we exploit sooner
+TARGET_UPDATE = 3    # Update target network more often
+EPISODE_LIMIT = 1000   # 1000 episodes total
 
+MAX_SPEED = 112.65  
+STEERING_VALUES = np.linspace(-0.5, 0.5, 3)  # [-0.5, 0.0, 0.5]
+SPEED_VALUES = np.linspace(0.0, 100.0, 3)   # [0.0, 50.0, 100.0]
+DISCRETE_ACTIONS = [(steer, speed) for steer in STEERING_VALUES for speed in SPEED_VALUES]
 
 class DQN(nn.Module):
-    """Neural network model for Q-learning."""
     def __init__(self, input_dim, output_dim):
         super(DQN, self).__init__()
         self.fc1 = nn.Linear(input_dim, 128)
@@ -32,15 +38,13 @@ class DQN(nn.Module):
     def forward(self, x):
         x = torch.relu(self.fc1(x))
         x = torch.relu(self.fc2(x))
-        return self.fc3(x)  # Output Q-values
-
+        return self.fc3(x)
 
 class DQNAgent:
-    """DQN agent with experience replay."""
     def __init__(self, env, alpha=LR):
         self.env = env
-        self.state_dim = 6  # Speed (1), GPS (2), LiDAR dist (1), LiDAR angle (1), Lane deviation (1)
-        self.action_dim = 2  # Steering angle, speed
+        self.state_dim = 6  # Updated to 6 to match flattened state (speed (1), gps (2), lidar_dist (1), lidar_angle (1), lane_deviation (1))
+        self.action_dim = len(DISCRETE_ACTIONS)
         self.memory = deque(maxlen=MEMORY_SIZE)
         self.epsilon = EPSILON_START
         self.epsilon_history = []
@@ -56,136 +60,137 @@ class DQNAgent:
         self.loss_fn = nn.MSELoss()
 
     def select_action(self, state):
-        """Selects an action using ε-greedy policy."""
+        # Epsilon-greedy selection over discrete actions.
         if np.random.rand() < self.epsilon:
-            return np.random.uniform([-0.5, 0.0], [0.5, 250.0])  # Random action in range
+            action_idx = np.random.randint(self.action_dim)
         else:
             state_tensor = torch.tensor(state, dtype=torch.float32).to(self.device).unsqueeze(0)
             with torch.no_grad():
                 q_values = self.policy_net(state_tensor)
-            return q_values.cpu().numpy()[0]
+            action_idx = int(torch.argmax(q_values, dim=1).item())
+        # Map the discrete action index to a continuous action.
+        continuous_action = np.array(DISCRETE_ACTIONS[action_idx])
+        return action_idx, continuous_action
 
-    def store_experience(self, state, action, reward, next_state, done):
-        """Stores experience in memory."""
-        self.memory.append((state, action, reward, next_state, done))
+    def store_experience(self, state, action_idx, reward, next_state, done):
+        self.memory.append((state, action_idx, reward, next_state, done))
 
     def train(self):
-        """Trains the DQN using experience replay."""
         if len(self.memory) < BATCH_SIZE:
             return
 
         batch = random.sample(self.memory, BATCH_SIZE)
-        states, actions, rewards, next_states, dones = zip(*batch)
+        states, action_idxs, rewards, next_states, dones = zip(*batch)
 
         states = torch.tensor(np.array(states), dtype=torch.float32).to(self.device)
-        actions = torch.tensor(np.array(actions), dtype=torch.float32).to(self.device)
+        actions = torch.tensor(action_idxs, dtype=torch.long).to(self.device).unsqueeze(1)
         rewards = torch.tensor(np.array(rewards), dtype=torch.float32).to(self.device)
         next_states = torch.tensor(np.array(next_states), dtype=torch.float32).to(self.device)
-        dones = torch.tensor(np.array(dones), dtype=torch.float32).to(self.device)
+        dones = torch.tensor([float(d) for d in dones], dtype=torch.float32).to(self.device)
 
-        # Compute current Q-values
-        current_q_values = self.policy_net(states)
+        current_q_values = self.policy_net(states).gather(1, actions).squeeze(1)
 
-        # Compute target Q-values
+        # Double DQN target
         with torch.no_grad():
-            next_q_values = self.target_net(next_states).max(1)[0]
+            next_actions = self.policy_net(next_states).argmax(dim=1, keepdim=True)
+            next_q_values = self.target_net(next_states).gather(1, next_actions).squeeze(1)
             target_q_values = rewards + GAMMA * next_q_values * (1 - dones)
 
-        loss = self.loss_fn(current_q_values.squeeze(), target_q_values.unsqueeze(1))
-
-        # Backpropagation
+        loss = self.loss_fn(current_q_values, target_q_values)
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
     def update_target_network(self):
-        """Updates target network with policy network weights."""
         self.target_net.load_state_dict(self.policy_net.state_dict())
 
     def decay_epsilon(self):
-        """Decay exploration rate ε."""
         self.epsilon = max(EPSILON_MIN, self.epsilon * EPSILON_DECAY)
 
-
 def flatten_state(state):
-    """Flattens dictionary state representation to a 1D array."""
+    # Original state is a dictionary with keys:
+    # "speed", "gps" (2-dim), "lidar_dist", "lidar_angle", "lane_deviation"
     return np.concatenate([
         state["speed"], 
         state["gps"], 
         state["lidar_dist"], 
         state["lidar_angle"], 
         state["lane_deviation"]
-    ]).astype(np.float32)
+    ])
 
+def train_dqn(agent):
+    episode = 0
 
-def train_dqn(agent, episodes=1000):
-    """Main training loop for DQN."""
-    for episode in range(episodes):
-        state = flatten_state(agent.env.reset())
-        total_reward = 0
+    try:
+        while episode < EPISODE_LIMIT:
+            state = flatten_state(agent.env.reset())
+            total_reward = 0
+            episode_steps = 0  # Counter for steps in the episode
+            done = False
 
-        for t in range(500):
-            action = agent.select_action(state)
-            next_state, reward, done = agent.env.step(action)
-            next_state = flatten_state(next_state)
+            # Run the simulation until the environment signals done.
+            while not done:
+                episode_steps += 1
+                action_idx, action = agent.select_action(state)
+                next_state, reward, done = agent.env.step(action)
+                next_state = flatten_state(next_state)
 
-            agent.store_experience(state, action, reward, next_state, done)
-            agent.train()
-            total_reward += reward
+                agent.store_experience(state, action_idx, reward, next_state, done)
+                agent.train()
+                total_reward += reward
+                state = next_state
 
-            state = next_state
-            if done:
-                break
+                # Optional: Add a safeguard for very long episodes
+                if episode_steps >= 10000:  # or some max_steps limit
+                    break
 
-        agent.decay_epsilon()
+            agent.decay_epsilon()
+            if episode % TARGET_UPDATE == 0:
+                agent.update_target_network()
 
-        if episode % TARGET_UPDATE == 0:
-            agent.update_target_network()
+            agent.rewards_history.append(total_reward)
+            agent.epsilon_history.append(agent.epsilon)
 
-        agent.rewards_history.append(total_reward)
-        agent.epsilon_history.append(agent.epsilon)
+            print(f"Episode {episode}, Total Reward: {total_reward:.2f}, Steps: {episode_steps}, Epsilon: {agent.epsilon:.3f}")
+            episode += 1
 
-        print(f"Episode {episode}, Total Reward: {total_reward}, Epsilon: {agent.epsilon:.4f}")
+    except KeyboardInterrupt:
+        print("⏹️ Training interrupted manually.")
+    except Exception as e:
+        print(f"❌ An error occurred: {e}")
+    
+    finally:
+        print("📊 Saving final plot...")
+        plot_training_progress(agent)
 
-    plot_training_progress(agent)
+def plot_training_progress(agent):
+    if not agent.rewards_history:
+        print("No rewards data to plot.")
+        return
 
-
-def plot_training_progress(agent, window_size=20):
-    """Plots total rewards and epsilon decay."""
-    fig, ax1 = plt.subplots(figsize=(12, 6))
-
-    # Plot total rewards
-    color = 'tab:blue'
-    ax1.set_xlabel("Episodes")
-    ax1.set_ylabel("Total Reward", color=color)
-    ax1.plot(agent.rewards_history, label="Total Reward", color=color, alpha=0.4)
-
-    # Smoothed rewards
-    if len(agent.rewards_history) >= window_size:
-        smoothed_rewards = np.convolve(agent.rewards_history, np.ones(window_size)/window_size, mode='valid')
-        ax1.plot(range(window_size - 1, len(agent.rewards_history)), smoothed_rewards, color='green', label="Smoothed Reward", linewidth=2)
-
-    ax1.tick_params(axis='y', labelcolor=color)
-
-    # Plot epsilon on secondary y-axis
-    ax2 = ax1.twinx()
-    color = 'tab:orange'
-    ax2.set_ylabel("Epsilon", color=color)
-    ax2.plot(agent.epsilon_history, label="Epsilon", color=color, linestyle='dashed')
-    ax2.tick_params(axis='y', labelcolor=color)
-
-    plt.title(f"Rewards and Epsilon Decay\nGamma: {GAMMA}, LR: {LR}, State bins: 6, Action bins: 2")
-    fig.tight_layout()
-
+    plt.figure(figsize=(12, 6))
+    plt.xlabel("Episodes")
+    plt.ylabel("Total Reward")
+    plt.plot(agent.rewards_history, label="Total Reward", alpha=0.8, color='blue')
+    plt.title("Rewards Progress")
+    plt.legend()
     plt.grid()
-    plt.savefig("dqn_rewards_epsilon_plot.png")
-    print("Plot saved as dqn_rewards_epsilon_plot.png")
+    plt.savefig("dqn_rewards_plot.png")
+    plt.close()
+    print("Plot saved as dqn_rewards_plot.png")
 
+if __name__ == "__main__":
+    env = WebotsCarEnv()
+    dqn_agent = DQNAgent(env)
 
-# Initialize Webots Environment and Agent
-env = WebotsCarEnv()
-dqn_agent = DQNAgent(env)
+    try:
+        train_dqn(dqn_agent)
+    except KeyboardInterrupt:
+        print("Training interrupted manually.")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+    finally:
+        plot_training_progress(dqn_agent)
+        print("Final plot saved.")
 
-# Train the DQN Agent
-train_dqn(dqn_agent)
-env.reset()
+    env.reset()
