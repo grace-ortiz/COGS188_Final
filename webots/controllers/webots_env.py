@@ -58,6 +58,9 @@ class WebotsCarEnv(gym.Env):
         self.prev_gps_speed = 0.0
         self.gps_speed = 0.0
         self.gps_coords = [0.0, 0.0, 0.0]
+
+        self.gyro = self.agent.getDevice("gyro")
+        self.gyro.enable(self.time_step)
         
         # Lidar state variables
         self.lidar_dist = 100.0
@@ -197,6 +200,10 @@ class WebotsCarEnv(gym.Env):
 
         if self._has_reached_goal():
             print("Goal reached.")
+            return True
+        
+        if abs(self.gyro.getValues()[0]) > 0.5:
+            print("Car flipped.")
             return True
 
         #current_time = self.agent.getTime()
