@@ -3,8 +3,11 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import random
+import os
+import sys
+import matplotlib.pyplot as plt
 from collections import deque
-import gymnasium as gym
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
 from webots_env import WebotsCarEnv
 
 # Hyperparameters
@@ -34,19 +37,22 @@ class DQN(nn.Module):
 
 class DQNAgent:
     """DQN agent with experience replay."""
-    def __init__(self, state_dim, action_dim):
-        self.state_dim = state_dim
-        self.action_dim = action_dim
+    def __init__(self, env, alpha=LR):
+        self.env = env
+        self.state_dim = 6  # Speed (1), GPS (2), LiDAR dist (1), LiDAR angle (1), Lane deviation (1)
+        self.action_dim = 2  # Steering angle, speed
         self.memory = deque(maxlen=MEMORY_SIZE)
         self.epsilon = EPSILON_START
+        self.epsilon_history = []
+        self.rewards_history = []
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.policy_net = DQN(state_dim, action_dim).to(self.device)
-        self.target_net = DQN(state_dim, action_dim).to(self.device)
+        self.policy_net = DQN(self.state_dim, self.action_dim).to(self.device)
+        self.target_net = DQN(self.state_dim, self.action_dim).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
 
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=LR)
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=alpha)
         self.loss_fn = nn.MSELoss()
 
     def select_action(self, state):
@@ -112,22 +118,15 @@ def flatten_state(state):
     ]).astype(np.float32)
 
 
-def train_dqn():
+def train_dqn(agent, episodes=1000):
     """Main training loop for DQN."""
-    env = WebotsCarEnv()
-    state_dim = 6  # Speed (1), GPS (2), LiDAR dist (1), LiDAR angle (1), Lane deviation (1)
-    action_dim = 2  # Steering angle, speed
-
-    agent = DQNAgent(state_dim, action_dim)
-
-    num_episodes = 1000
-    for episode in range(num_episodes):
-        state = flatten_state(env.reset())
+    for episode in range(episodes):
+        state = flatten_state(agent.env.reset())
         total_reward = 0
 
         for t in range(500):
             action = agent.select_action(state)
-            next_state, reward, done = env.step(action)
+            next_state, reward, done = agent.env.step(action)
             next_state = flatten_state(next_state)
 
             agent.store_experience(state, action, reward, next_state, done)
@@ -143,10 +142,50 @@ def train_dqn():
         if episode % TARGET_UPDATE == 0:
             agent.update_target_network()
 
-        print(f"Episode {episode}, Total Reward: {total_reward}, Epsilon: {agent.epsilon}")
+        agent.rewards_history.append(total_reward)
+        agent.epsilon_history.append(agent.epsilon)
 
-    env.close()
+        print(f"Episode {episode}, Total Reward: {total_reward}, Epsilon: {agent.epsilon:.4f}")
+
+    plot_training_progress(agent)
 
 
-if __name__ == "__main__":
-    train_dqn()
+def plot_training_progress(agent, window_size=20):
+    """Plots total rewards and epsilon decay."""
+    fig, ax1 = plt.subplots(figsize=(12, 6))
+
+    # Plot total rewards
+    color = 'tab:blue'
+    ax1.set_xlabel("Episodes")
+    ax1.set_ylabel("Total Reward", color=color)
+    ax1.plot(agent.rewards_history, label="Total Reward", color=color, alpha=0.4)
+
+    # Smoothed rewards
+    if len(agent.rewards_history) >= window_size:
+        smoothed_rewards = np.convolve(agent.rewards_history, np.ones(window_size)/window_size, mode='valid')
+        ax1.plot(range(window_size - 1, len(agent.rewards_history)), smoothed_rewards, color='green', label="Smoothed Reward", linewidth=2)
+
+    ax1.tick_params(axis='y', labelcolor=color)
+
+    # Plot epsilon on secondary y-axis
+    ax2 = ax1.twinx()
+    color = 'tab:orange'
+    ax2.set_ylabel("Epsilon", color=color)
+    ax2.plot(agent.epsilon_history, label="Epsilon", color=color, linestyle='dashed')
+    ax2.tick_params(axis='y', labelcolor=color)
+
+    plt.title(f"Rewards and Epsilon Decay\nGamma: {GAMMA}, LR: {LR}, State bins: 6, Action bins: 2")
+    fig.tight_layout()
+
+    plt.grid()
+    plt.savefig("dqn_rewards_epsilon_plot.png")
+    print("Plot saved as dqn_rewards_epsilon_plot.png")
+
+
+# Initialize Webots Environment and Agent
+env = WebotsCarEnv()
+dqn_agent = DQNAgent(env)
+
+# Train the DQN Agent
+train_dqn(dqn_agent)
+env.reset()
