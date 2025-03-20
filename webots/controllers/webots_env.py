@@ -233,7 +233,7 @@ class WebotsCarEnv(gym.Env):
             print("Goal reached.")
             return True
         
-        if abs(self.gyro.getValues()[0]) > 0.5:
+        if abs(self.gyro.getValues()[0]) > 0.4:
             print("Car flipped.")
             return True
         

@@ -173,6 +173,9 @@ def train_dqn(agent):
             agent.epsilon = min(EPSILON_START, agent.epsilon + 0.3)
             print(f"Epsilon reset at episode {episode}: epsilon={agent.epsilon:.2f}")
 
+        if episode % 50 == 0:
+            plot_training_progress(agent)  # save intermediate plots
+
         agent.rewards_history.append(total_reward)
         agent.epsilon_history.append(agent.epsilon)
 
