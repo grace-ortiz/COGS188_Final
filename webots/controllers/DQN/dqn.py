@@ -173,15 +173,13 @@ def train_dqn(agent):
             agent.epsilon = min(EPSILON_START, agent.epsilon + 0.3)
             print(f"Epsilon reset at episode {episode}: epsilon={agent.epsilon:.2f}")
 
-        if episode % 50 == 0:
-            plot_training_progress(agent)  # save intermediate plots
-
         agent.rewards_history.append(total_reward)
         agent.epsilon_history.append(agent.epsilon)
 
         print(f"Episode {episode}, Total Reward: {total_reward:.2f}, Steps: {steps}, Epsilon: {agent.epsilon:.3f}")
 
-    plot_training_progress(agent)
+        if episode % 50 == 0:
+            plot_training_progress(agent)  # save intermediate plots
 
 if __name__ == "__main__":
     env = WebotsCarEnv()
