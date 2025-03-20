@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -8,7 +7,6 @@ import os
 import sys
 import matplotlib.pyplot as plt
 from collections import deque
-import torch.optim as optim
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
 from webots_env import WebotsCarEnv
@@ -18,17 +16,30 @@ GAMMA = 0.99
 LR = 0.0001
 BATCH_SIZE = 64
 MEMORY_SIZE = 100000
-EPSILON_START = 1.0
+EPSILON_START = 0.85
 EPSILON_MIN = 0.1
 EPSILON_DECAY = 0.9995
 TARGET_UPDATE = 5
-EPISODE_LIMIT = 1000
+EPISODE_LIMIT = 500
 
 MAX_SPEED = 112.65  
 STEERING_VALUES = np.linspace(-0.5, 0.5, 3)
 SPEED_VALUES = np.linspace(0.0, 100.0, 3)
 DISCRETE_ACTIONS = [(steer, speed) for steer in STEERING_VALUES for speed in SPEED_VALUES]
 
+# Moving Average Function
+def moving_average(data, window_size=20):
+    if len(data) < window_size:
+        return np.array(data)  
+    return np.convolve(data, np.ones(window_size) / window_size, mode='valid')
+
+# Policy Efficiency Function
+def policy_efficiency(rewards, steps):
+    if not rewards or not steps or np.sum(steps) == 0:
+        return 0
+    return np.sum(rewards) / np.sum(steps)  # Avg reward per step
+
+# Neural Network Model
 class DQN(nn.Module):
     def __init__(self, input_dim, output_dim):
         super(DQN, self).__init__()
@@ -43,6 +54,7 @@ class DQN(nn.Module):
         x = torch.relu(self.fc3(x))
         return self.fc4(x)
 
+# DQN Agent
 class DQNAgent:
     def __init__(self, env):
         self.env = env
@@ -52,6 +64,7 @@ class DQNAgent:
         self.epsilon = EPSILON_START
         self.epsilon_history = []
         self.rewards_history = []
+        self.steps_history = []
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.policy_net = DQN(self.state_dim, self.action_dim).to(self.device)
@@ -78,7 +91,6 @@ class DQNAgent:
     def train(self):
         if len(self.memory) < BATCH_SIZE:
             return
-
         batch = random.sample(self.memory, BATCH_SIZE)
         states, action_idxs, rewards, next_states, dones = zip(*batch)
 
@@ -107,43 +119,16 @@ class DQNAgent:
         self.epsilon = max(EPSILON_MIN, self.epsilon * EPSILON_DECAY)
 
 def flatten_state(state):
+    """Flattens the state dictionary into a numpy array."""
     return np.concatenate([
-        state["speed"], state["gps"], state["lidar_dist"], state["lidar_angle"], state["lane_deviation"]
+        np.array(state["speed"]).flatten(),
+        np.array(state["gps"]).flatten(),
+        np.array(state["lidar_dist"]).flatten(),
+        np.array(state["lidar_angle"]).flatten(),
+        np.array(state["lane_deviation"]).flatten()
     ])
 
-def plot_training_progress(agent):
-    plt.figure(figsize=(12, 6))
-    episodes = range(len(agent.rewards_history))
-
-    fig, ax1 = plt.subplots(figsize=(12, 6))
-
-    color = 'tab:blue'
-    ax1 = ax1 = plt.gca()
-    ax1.set_xlabel('Episodes')
-    ax1.set_ylabel('Total Reward', color=color)
-    ax1.plot(agent.rewards_history, color=color, alpha=0.4, label='Total Reward')
-
-    # Smooth rewards
-    if len(agent.rewards_history) > 20:
-        smoothed_rewards = np.convolve(agent.rewards_history, np.ones(20)/20, mode='valid')
-        ax1.plot(smoothed_rewards, color=color, label='Smoothed Reward')
-
-    ax1.tick_params(axis='y', labelcolor=color)
-
-    ax2 = ax1.twinx() 
-    color = 'tab:orange'
-    ax2.set_ylabel('Epsilon', color=color)
-    ax2.plot(agent.epsilon_history, linestyle='--', color=color, label='Epsilon')
-    ax2.tick_params(axis='y', labelcolor=color)
-
-    fig.tight_layout() 
-    plt.title('DQN Training Progress')
-    plt.grid(True)
-    plt.legend()
-    plt.savefig("dqn_rewards_epsilon_plot.png")
-    plt.close()
-    print("Plot saved as dqn_rewards_epsilon_plot.png")
-
+# Training Function
 def train_dqn(agent):
     for episode in range(EPISODE_LIMIT):
         state = flatten_state(agent.env.reset())
@@ -161,26 +146,66 @@ def train_dqn(agent):
             state = next_state
             steps += 1
 
-            if steps > 10000:
-                break
-
         agent.decay_epsilon()
         if episode % TARGET_UPDATE == 0:
             agent.update_target_network()
 
-        # periodic epsilon reset to boost exploration occasionally
-        if episode % 100 == 0 and agent.epsilon < 0.2:
-            agent.epsilon = min(EPSILON_START, agent.epsilon + 0.3)
-            print(f"Epsilon reset at episode {episode}: epsilon={agent.epsilon:.2f}")
-
         agent.rewards_history.append(total_reward)
+        agent.steps_history.append(steps)
         agent.epsilon_history.append(agent.epsilon)
 
-        print(f"Episode {episode}, Total Reward: {total_reward:.2f}, Steps: {steps}, Epsilon: {agent.epsilon:.3f}")
+        print(f"Episode {episode}, Reward: {total_reward:.2f}, Steps: {steps}, Epsilon: {agent.epsilon:.3f}")
 
         if episode % 50 == 0:
-            plot_training_progress(agent)  # save intermediate plots
+            plot_training_progress(agent)
 
+def plot_training_progress(agent):
+    if len(agent.rewards_history) < 20:
+        print("Not enough data to plot (need at least 20 episodes).")
+        return
+
+    episodes = np.arange(len(agent.rewards_history))
+
+    fig, axes = plt.subplots(3, 1, figsize=(10, 12))
+
+    # Plot total reward per episode
+    axes[0].plot(episodes, agent.rewards_history, label="Total Reward", color="blue", alpha=0.7)
+    axes[0].set_title("Total Rewards per Episode")
+    axes[0].set_xlabel("Episodes")
+    axes[0].set_ylabel("Total Reward")
+    axes[0].grid(True, linestyle="--", alpha=0.5)
+    axes[0].legend()
+
+    # Plot moving average of rewards (only if enough data exists)
+    if len(agent.rewards_history) >= 50:
+        smoothed_rewards = moving_average(agent.rewards_history, window_size=20)
+        axes[1].plot(range(len(smoothed_rewards)), smoothed_rewards, color="green", linestyle="dashed", linewidth=2, label="Smoothed Reward")
+        axes[1].set_title("Moving Average of Rewards")
+        axes[1].set_xlabel("Episodes")
+        axes[1].set_ylabel("Smoothed Reward")
+        axes[1].grid(True, linestyle="--", alpha=0.5)
+        axes[1].legend()
+
+    # Policy efficiency with rolling window
+    window_size = 20  # Adjustable window size for smoother trends
+    if len(agent.rewards_history) >= window_size:
+        avg_rewards_per_step = [
+            policy_efficiency(agent.rewards_history[max(0, i - window_size):i], agent.steps_history[max(0, i - window_size):i])
+            for i in range(window_size, len(agent.rewards_history))
+        ]
+        axes[2].plot(range(len(avg_rewards_per_step)), avg_rewards_per_step, color="red", linestyle="solid", linewidth=1.5, label="Policy Efficiency (Rolling Avg)")
+        axes[2].set_title("Policy Efficiency (Avg Reward per Step)")
+        axes[2].set_xlabel("Episodes")
+        axes[2].set_ylabel("Efficiency")
+        axes[2].grid(True, linestyle="--", alpha=0.5)
+        axes[2].legend()
+
+    plt.tight_layout()
+    plt.savefig("dqn_training_metrics.png", dpi=300, bbox_inches="tight")
+    plt.show()  # Optional: Show the plot for quick debugging
+    print("✅ Plots saved as dqn_training_metrics.png")
+
+# Run Training
 if __name__ == "__main__":
     env = WebotsCarEnv()
     dqn_agent = DQNAgent(env)
