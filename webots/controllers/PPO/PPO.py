@@ -17,13 +17,13 @@ LR = 0.0003          # Learning rate
 BATCH_SIZE = 256     # Batch size for PPO updates
 MEMORY_SIZE = 10000  # Replay memory size
 CLIP_EPSILON = 0.2   # Clipping parameter for PPO
-EPOCHS = 10          # Number of epochs for PPO updates
+EPOCHS = 5          # Number of epochs for PPO updates
 
 # State and action limits
 STATE_DIM = 6         # Speed, GPS(x,y), LiDAR dist, LiDAR angle, lane deviation
 ACTION_DIM = 2         # Steering angle, speed
-MAX_EPISODES = 1500    # Number of training episodes
-MAX_TIMESTEPS = 10000    # Max timesteps per episode
+MAX_EPISODES = 1000   # Number of training episodes
+MAX_TIMESTEPS = 10000  # Max timesteps per episode
 ACTION_LOW = np.array([-0.5, 0.0])    # Steering range: [-0.5, 0.5], Speed range: [0, 150]
 ACTION_HIGH = np.array([0.5, 150.0])
 
@@ -79,29 +79,18 @@ class PPOAgent:
     def select_action(self, state):
         """Selects an action using the policy network with exploration noise."""
         state_tensor = torch.tensor(state, dtype=torch.float32).to(DEVICE).unsqueeze(0)
-
-        with torch.no_grad():
-            mean, std = self.policy_net(state_tensor)
-
-        # Clamp std to prevent extreme values
-        std = std.clamp(0.01, 1.0)
-
-        # Create distribution
+        mean, std = self.policy_net(state_tensor)
         dist = torch.distributions.Normal(mean, std)
-
-        # Sample and clamp the action within valid range
-        raw_action = dist.sample().squeeze(0)
         
-        # Map action to valid range
-        mapped_action = map_action(raw_action.cpu().numpy())
+        # Sample raw action and calculate log probability on the raw action
+        raw_action = dist.sample()
+        log_prob = dist.log_prob(raw_action).sum(dim=-1)  # sum over action dimensions
+        
+        # Apply tanh to squash the action to [-1, 1]
+        squashed_action = torch.tanh(raw_action)
+        mapped_action = map_action(squashed_action.cpu().numpy().squeeze())
 
-        # Ensure the mapped action is converted back to tensor before calculating log_prob
-        mapped_action_tensor = torch.tensor(mapped_action, dtype=torch.float32).to(DEVICE)
-
-        # Use the correct distribution for log_prob calculation
-        log_prob = dist.log_pr
-
-
+        return mapped_action, log_prob.item()
 
     def store_experience(self, state, action, reward, next_state, done, log_prob):
         """Stores experience in memory."""
@@ -162,29 +151,28 @@ def flatten_state(state):
     ]).astype(np.float32)
     
 def map_action(action):
-    """Maps action from [-1, 1] to the valid action range dynamically."""
+    """Maps action from [-1, 1] to the valid action range."""
     action = np.clip(action, -1.0, 1.0)  
     mapped_action = np.zeros_like(action)
 
-    # Steering angle
+    # Steering angle mapping
     mapped_action[0] = ACTION_LOW[0] + (0.5 * (action[0] + 1.0) * (ACTION_HIGH[0] - ACTION_LOW[0]))
 
-    # Speed
+    # Speed mapping
     mapped_action[1] = ACTION_LOW[1] + (0.5 * (action[1] + 1.0) * (ACTION_HIGH[1] - ACTION_LOW[1]))
 
     return mapped_action
 
-
-def train_ppo(agent, episodes=MAX_EPISODES):
-    """Main training loop."""
+def train_ppo(agent, episodes=MAX_EPISODES, plot_interval=50):
+    """Main training loop for PPO with periodic plotting."""
     for episode in range(episodes):
         state = flatten_state(agent.env.reset())
         total_reward = 0
+        done = False
+        steps = 0
 
-        for t in range(MAX_TIMESTEPS):
+        while not done:
             action, log_prob = agent.select_action(state)
-
-            print("action: ", action)
             next_state, reward, done = agent.env.step(action)
             next_state = flatten_state(next_state)
 
@@ -193,24 +181,25 @@ def train_ppo(agent, episodes=MAX_EPISODES):
 
             state = next_state
             total_reward += reward
+            steps += 1
 
-            if done:
+            if steps > 10000:
                 break
 
         agent.rewards_history.append(total_reward)
 
-        print(f"Episode {episode + 1}/{episodes}, Total Reward: {total_reward}")
+        print(f"Episode {episode}, Total Reward: {total_reward:.2f}, Steps: {steps}")
 
-        if (episode + 1) % 50 == 0:
-            torch.save(agent.policy_net.state_dict(), f"ppo_policy_ep{episode + 1}.pth")
-            torch.save(agent.value_net.state_dict(), f"ppo_value_ep{episode + 1}.pth")
-            print(f"Checkpoint saved at episode {episode + 1}")
+        # Save plot periodically
+        if episode % plot_interval == 0:
+            plot_training_progress(agent, filename=f"ppo_rewards_plot_ep{episode}.png")
 
-    plot_training_progress(agent)
+    # Save final plot
+    plot_training_progress(agent, filename="ppo_rewards_plot_final.png")
 
 
-def plot_training_progress(agent, window_size=20):
-    """Plots total rewards over episodes."""
+def plot_training_progress(agent, window_size=20, filename="ppo_rewards_plot.png"):
+    """Plots total rewards over episodes and saves the figure."""
     plt.figure(figsize=(12, 6))
     plt.plot(agent.rewards_history, label="Total Reward", color='blue', alpha=0.4)
 
@@ -218,17 +207,20 @@ def plot_training_progress(agent, window_size=20):
         smoothed_rewards = np.convolve(
             agent.rewards_history, np.ones(window_size) / window_size, mode='valid'
         )
-        plt.plot(range(window_size - 1, len(agent.rewards_history)), smoothed_rewards, color='green', label="Smoothed Reward", linewidth=2)
+        plt.plot(range(window_size - 1, len(agent.rewards_history)), smoothed_rewards, 
+                 color='green', label="Smoothed Reward", linewidth=2)
 
     plt.xlabel("Episodes")
     plt.ylabel("Total Reward")
     plt.title("PPO Rewards Over Episodes")
     plt.grid()
     plt.legend()
-    plt.savefig("ppo_rewards_plot.png")
-    print("Plot saved as ppo_rewards_plot.png")
+    plt.savefig(filename)
+    plt.close()  # close the figure to free memory
+    print(f"Plot saved as {filename}")
 
 
+# Initialize environment and agent, then start training
 env = WebotsCarEnv()
 ppo_agent = PPOAgent(env)
 

@@ -4,17 +4,15 @@ import numpy as np
 import cv2
 from vehicle import Driver
 
-MAX_STEER_ANGLE = 0.4
-MIN_STEER_ANGLE = -0.4
-MAX_SPEED = 150.0
+MAX_STEER_ANGLE = 0.5
+MIN_STEER_ANGLE = -0.5
+MAX_SPEED = 250.0   # ~ 155 mph
 MIN_SPEED = 0.0
-MAX_SPEED_CHANGE = 75.0
 
 MAX_SAFE_SPEED = 112.65  # ~ 70 mph
-CITY_SPEED_LIMIT = 48.28  # ~ 30 mph
+CITY_SPEED_LIMIT = 72.42  # ~ 45 mph
 
-# MAX_SIM_TIME = 120  # 2 min max sim time
-MAX_EPI_TIME = 60 # 1 min max episode time
+EPISODE_DURATION = 600
 
 GOAL_COORDS = [-47.75, 59.5]
 GOAL_THRESHOLD = [1.75, 0.5]  # how close to goal to count as reached (in meters)
@@ -28,7 +26,6 @@ class WebotsCarEnv(gym.Env):
         
         self.agent = Driver()
         self.time_step = int(self.agent.getBasicTimeStep())
-        self.start_time = None 
         
         # action space: [steering, speed]
         self.action_space = spaces.Box(
@@ -42,7 +39,7 @@ class WebotsCarEnv(gym.Env):
             "speed": spaces.Box(low=0, high=MAX_SPEED, shape=(1,), dtype=np.float32),  # gps speed
             "gps": spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32),  # (x, y) gps coordinates
             "lidar_dist": spaces.Box(low=0, high=100, shape=(1,), dtype=np.float32),  # distance to nearest obstacle
-            "lidar_angle": spaces.Box(low=-90, high=90, shape=(1,), dtype=np.float32),  # angle to nearest obstacle
+            "lidar_angle": spaces.Box(low=-180, high=180, shape=(1,), dtype=np.float32),  # angle to nearest obstacle
             "lane_deviation": spaces.Box(low=0, high=np.inf, shape=(1,), dtype=np.float32),  # pixels away from lane center
             "lane_mask": spaces.Box(low=0, high=1, shape=(64, 128, 1), dtype=np.uint8)  # binary mask for lane line (yellow line only)
         })
@@ -57,23 +54,35 @@ class WebotsCarEnv(gym.Env):
         self.lidar = self.agent.getDevice("lidar")
         self.lidar.enable(self.time_step)
         
-        self.gyro = self.agent.getDevice("gyro")
-        self.gyro.enable(self.time_step)
-        
         # Initialize state variables
         self.prev_gps_speed = 0.0
         self.gps_speed = 0.0
         self.gps_coords = [0.0, 0.0, 0.0]
-        
-        self.prev_set_speed = 0.0
-        
-        self.progress = 0.0
+
+        self.gyro = self.agent.getDevice("gyro")
+        self.gyro.enable(self.time_step)
         
         # Lidar state variables
         self.lidar_dist = 100.0
         self.lidar_angle = 0.0
         self.collision_counter = 0
+
+        self.stationary_counter = 0
+        self.max_stationary_steps = 1000
+        self.min_movement_speed = 1.0  # km/h, threshold for defining "stationary"
         
+        self.ep_start_time = 0
+
+        # Reward tracking per episode
+        self.episode_rewards = {
+            "collision": 0.0,
+            "lane_deviation": 0.0,
+            "speed": 0.0,
+            "obstacle": 0.0,
+            "goal": 0.0
+        }
+        self.episode_number = 1
+
         self.reset_flag = self.agent.getFromDef("RESET_FLAG")
                         
                 
@@ -82,7 +91,7 @@ class WebotsCarEnv(gym.Env):
         speed = np.clip(action[1], MIN_SPEED, MAX_SPEED)
         
         self._set_steering_angle(steering_angle)
-        self._set_cruising_speed(speed)
+        self.agent.setCruisingSpeed(speed)
         self._calc_gps_speed()
 
         self.agent.step()
@@ -91,23 +100,35 @@ class WebotsCarEnv(gym.Env):
         reward = self._compute_reward()
         done = self._is_done()
 
+        if self.gps_speed <= self.min_movement_speed:
+            self.stationary_counter += 1
+        else:
+            self.stationary_counter = 0  # reset if car moves again
+
         return state, reward, done
     
     
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self.done = False
-        self._collision_counter = 0  
+        
         self.agent.setSteeringAngle(0)
         self.agent.setCruisingSpeed(0)
         self.reset_flag.getField("translation").setSFVec3f([1, 0, 0])  # send out flag to dummy node
         
-        self.start_time = self.agent.getTime()
-        
-        for _ in range(5):  
-            self.agent.step()
+        self.agent.step() 
+
+        # Reset episode start time
+        self.episode_start_time = self.agent.getTime()
+
+        # Reset reward trackers
+        for key in self.episode_rewards:
+            self.episode_rewards[key] = 0.0
+    
+        self.stationary_counter = 0
 
         state = self._get_state()
+
+        self.collision_counter = 0
 
         return state
     
@@ -141,8 +162,7 @@ class WebotsCarEnv(gym.Env):
         if any(np.isnan(position)) or np.isnan(speed):
             raise ValueError(f"Invalid observation values: speed={speed}, position={position}")
 
-        _, lane_deviation = self._calc_lane_reward(k=1)
-        print(f"lane deviation: {lane_deviation}")
+        lane_deviation = self._calc_lane_penalty(k=1)
         
         return {
             "speed": np.array([speed], dtype=np.float32),
@@ -152,53 +172,65 @@ class WebotsCarEnv(gym.Env):
             "lane_deviation": np.array([lane_deviation], dtype=np.float32),
             "lane_mask": np.expand_dims(edges, axis=-1).astype(np.uint8)
         }
-    
+        
     def _compute_reward(self):
-        reward = 0.0
-        
-        # Collision penalty
-        if self._has_collided() or abs(self.gyro.getValues()[0]) > 0.5:
-            reward -= 100
-            
-        lane_reward, _ = self._calc_lane_reward(k=1)
-        reward += lane_reward
-        
-         # Speed efficiency reward          
-        if 5 < self.gps_speed < CITY_SPEED_LIMIT:  # Favorable speed range
-            reward += 15
-        elif self.gps_speed > MAX_SAFE_SPEED:
-            reward -= 20
-        elif self.gps_speed >= CITY_SPEED_LIMIT:  # Penalty for speeding
-            reward -= 10  
-        elif self.gps_speed < 3:  # Penalty for stalling
-            reward -= 70
-        
-        reward += self.gps_speed *.5  # speed progress reward
-        
-        # Distance-based reward    
-        current_pos = np.linalg.norm(self.gps_coords[:2])
-        progress_reward = max(0, current_pos - self.progress) * 500
-        if current_pos > self.progress:
-            reward += progress_reward
-            print("progress reward: ", progress_reward)
-        self.progress = current_pos
-        
-         
-        # Obstacle avoidance penalty       
+        total_reward = 0.0
+
+        # Lane deviation reward (linear, stable)
+        lane_error = self._calc_lane_penalty(k=0.6)
+        lane_reward = max(-1.0, 1.5 - (0.05 * lane_error))
+        self.episode_rewards["lane_deviation"] += lane_reward
+        total_reward += lane_reward
+
+        # Speed reward (stable)
+        speed_reward = 0.0
+        # Progressive forward-speed reward
+        if 10 < self.gps_speed <= CITY_SPEED_LIMIT:
+            speed_reward = 2.0
+        elif 5 < self.gps_speed <= 10:
+            speed_reward = 0.5  # modest reward for slow movement
+        else:
+            speed_reward = -1.0  # penalize stationary or very slow speeds
+
+        # Retrieve the current steering angle
+        steering_angle = abs(self.agent.getSteeringAngle())
+
+        # Now safely use steering_angle
+        steering_penalty = -0.02 * steering_angle
+        total_reward += steering_penalty
+
+        overshoot = self.gps_speed - MAX_SAFE_SPEED
+        if overshoot > 0:
+            speed_reward -= 0.3 * overshoot
+
+        self.episode_rewards["speed"] += speed_reward
+        total_reward += speed_reward
+
+        # Obstacle penalty (if any)
+        obstacle_penalty = 0.0
         if abs(self.lidar_angle) < 15 and self.lidar_dist < 2.0:
-            extra_penalty = (2.0 - self.lidar_dist) * 100
-            reward -= extra_penalty
-        elif abs(self.lidar_angle) < 60:
-            off_course_penalty = (90 - abs(self.lidar_angle))
-            reward -= off_course_penalty
-        
+            obstacle_penalty = (2.0 - self.lidar_dist) * 5.0
+            self.episode_rewards["obstacle"] -= obstacle_penalty
+            total_reward -= obstacle_penalty
+
+        # Goal bonus (if goal is reached)
+        goal_bonus = 0.0
         if self._has_reached_goal():
-            reward += 1000
-            
-        print(f"Total reward: {reward}")
-        return reward
-    
-    
+            goal_bonus = 200.0
+            self.episode_rewards["goal"] += goal_bonus
+            total_reward += goal_bonus
+
+        # Collision penalty (scaled by distance or elapsed time)
+        collision_penalty = 0.0
+        if self._has_collided():
+            elapsed_time = self.agent.getTime() - self.episode_start_time
+            collision_penalty = max(-200 + elapsed_time, -10)
+            self.episode_rewards["collision"] += collision_penalty
+            total_reward += collision_penalty
+            print(f"Collision penalty applied (scaled): {collision_penalty:.2f}")
+
+        return total_reward
+        
     def _is_done(self):
         if self._has_collided():
             print("Collision detected.")
@@ -207,18 +239,22 @@ class WebotsCarEnv(gym.Env):
         if self._has_reached_goal():
             print("Goal reached.")
             return True
-
-        elapsed_time = self.agent.getTime() - self.start_time
-        if elapsed_time >= MAX_EPI_TIME:
-            print("Time limit reached.")
-            return True
         
-        if abs(self.gyro.getValues()[0]) > 0.5:
+        if abs(self.gyro.getValues()[0]) > 0.4:
             print("Car flipped.")
             return True
+        
+        elapsed_time = self.agent.getTime() - self.episode_start_time
+        if elapsed_time >= EPISODE_DURATION:
+            print("Episode duration reached.")
+            return True
+        
+        # End if car remains stationary too long
+        if self.stationary_counter >= self.max_stationary_steps:
+            print("Car stationary for too long. Ending episode.")
+            return True
             
-        return False 
-    
+        return False  # Explicitly return False when not done
     
     def _has_collided(self):
         # LIDAR collision detection using central region of lidar scan
@@ -259,7 +295,6 @@ class WebotsCarEnv(gym.Env):
         
         return False
     
-    
     def _has_reached_goal(self):
         current_pos = self.gps_coords
         x_dist = abs(current_pos[0] - GOAL_COORDS[0]) < GOAL_THRESHOLD[0]
@@ -283,15 +318,6 @@ class WebotsCarEnv(gym.Env):
             
         self.agent.setSteeringAngle(wheel_angle)
         return
-    
-    
-    def _set_cruising_speed(self, cruising_speed):
-        speed_diff = np.clip(cruising_speed - self.prev_set_speed, -MAX_SPEED_CHANGE, MAX_SPEED_CHANGE)
-        smoothed_speed = self.prev_set_speed + speed_diff
-        
-        self.agent.setCruisingSpeed(smoothed_speed)
-        self.prev_speed = smoothed_speed
-        return
         
         
     def _calc_gps_speed(self):
@@ -304,37 +330,27 @@ class WebotsCarEnv(gym.Env):
             self.gps_coords = list(coords)
     
     
-    def _calc_lane_reward(self, k=1.0):
+    def _calc_lane_penalty(self, k=0.6):
         frame = self._process_image()
         edges = self._create_lane_mask(frame)
         left_lane = self._sliding_window_detect_lanes(edges)
         
         if not left_lane:
-            penalty = -80
-            deviation = 48 
+            return 50  # heavy penalty if no lane detected
         
         # avg of x pos of lane points closest to the car
         # x_right = max(right_lane, key=lambda pt: pt[1])[0]
         x_left = max(left_lane, key=lambda pt: pt[1])[0]
+            
+        if x_left == 0:
+            return 20
         
         x_vehicle = self.camera.getWidth() // 2
         lane_center = (x_left + 48)
         deviation = abs(x_vehicle - lane_center)
         
-        penalty = k * -(deviation)
-        
-        if x_left == 0:
-            penalty = -80
-            deviation = 48
-         
-        if deviation < 5:
-            penalty = 100 
-        elif deviation < 10:
-            penalty = 60
-        elif deviation < 20:
-            penalty = 40
-        print("lane penalty: ", penalty)
-        return penalty, deviation
+        penalty = k * deviation
+        return penalty
         
       
     def _process_image(self):
@@ -459,5 +475,5 @@ class WebotsCarEnv(gym.Env):
         angle_rad = -fov / 2 + (min_index * fov / (n - 1))
         angle_deg = np.degrees(angle_rad)
         
-        print(f"Lidar - min_distance: {min_distance:.2f}, angle_deg: {angle_deg:.2f}")
+        #print(f"Lidar - min_distance: {min_distance:.2f}, angle_deg: {angle_deg:.2f}")
         return min_distance, angle_deg
