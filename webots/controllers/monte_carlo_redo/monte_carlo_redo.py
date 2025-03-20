@@ -13,13 +13,11 @@ import seaborn as sns
 
 
 
-STATE_BINS = [15, 8, 8, 6, 8, 15]  # 6 discrete dimensions
+STATE_BINS = [15, 6, 8, 15]  # 6 discrete dimensions
 ACTION_BINS = [15, 6]
 
 STATE_LIMITS = [
     (0, 150),     # speed
-    (-100, 100),  # gps_x
-    (-100, 100),  # gps_y
     (0, 100),     # lidar_dist
     (-90, 90),    # lidar_angle
     (0, 48)       # lane_deviation
@@ -32,7 +30,7 @@ ACTION_LIMITS = [
 
 
 class MonteCarlo:
-    def __init__(self, env: WebotsCarEnv, gamma: float = 1.0, epsilon: float = 0.1, Q0: float = 0.0, max_episode_size : int = 100000):
+    def __init__(self, env: WebotsCarEnv, gamma: float = 1.0, epsilon: float = 0.15, Q0: float = 0.0, max_episode_size : int = 100000):
             self.env = env
             self.gamma = gamma
             self.epsilon = epsilon
@@ -49,12 +47,11 @@ class MonteCarlo:
     def discretize_state(self, state):
         discrete_state = []
         speed = state["speed"][0]
-        gps_x, gps_y = state["gps"]
         lidar_dist = state["lidar_dist"][0]
         lidar_angle = state["lidar_angle"][0]
         lane_deviation = state["lane_deviation"][0]
 
-        state_values = [speed, gps_x, gps_y, lidar_dist, lidar_angle, lane_deviation]
+        state_values = [speed, lidar_dist, lidar_angle, lane_deviation]
 
         for value, (low, high), bins in zip(state_values, STATE_LIMITS, STATE_BINS):
             value = np.clip(value, low, high)
@@ -253,24 +250,23 @@ steps = []
 behavior_rewards = []
 target_rewards = []
 
-num_learners = 1
-num_episodes = 200
+num_episodes = 500
 
-for j in tqdm(range(num_learners)):
-    MC = MonteCarlo(env, max_episode_size=1000000)
-    this_steps = []
-    this_rewards = []
+MC = MonteCarlo(env, max_episode_size=1000000)
+this_steps = []
+this_rewards = []
 
-    for k in range(num_episodes):
-        episode = MC.generate_egreedy_episode()
-        this_rewards.append(pd.DataFrame(episode).iloc[:, -1].sum())
-        this_steps.append(len(episode))
-        MC.update_offpolicy(episode)
-
-    steps.append(this_steps)
-    behavior_rewards.append(this_rewards)
-
+for k in range(num_episodes):
     episode = MC.generate_egreedy_episode()
-    target_rewards.append(pd.DataFrame(episode).iloc[:, -1].sum())
+    this_rewards.append(pd.DataFrame(episode).iloc[:, -1].sum())
+    this_steps.append(len(episode))
+    MC.update_offpolicy(episode)
+    print(f"Episode {k} finished")
+
+steps.append(this_steps)
+behavior_rewards.append(this_rewards)
+
+episode = MC.generate_greedy_episode()
+target_rewards.append(pd.DataFrame(episode).iloc[:, -1].sum())
 
 visualize_training(behavior_rewards, target_rewards)
