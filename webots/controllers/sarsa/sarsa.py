@@ -123,27 +123,9 @@ class SARSA:
             self.steps_history.append(steps)  # <== Store steps for this episode
             self.epsilon_history.append(self.epsilon)
 
-            # Save best-performing Q-table
-            if total_reward > best_reward:
-                best_reward = total_reward
-                with open("best_q_table.pkl", "wb") as f:
-                    pickle.dump(self.q_table, f)
-                print(f"Best Q-table saved at episode {episode + 1} with reward: {best_reward}")
-
-            # Save Q-table periodically
-            if (episode + 1) % save_interval == 0:
-                filename = f"q_table_ep_{episode + 1}.pkl"
-                with open(filename, "wb") as f:
-                    pickle.dump(self.q_table, f)
-                print(f"Q-table saved at episode {episode + 1}")
-
-            print(f"Episode {episode + 1}/{episodes}, Reward: {total_reward}, Steps: {steps}, Epsilon: {self.epsilon:.4f}")
-            
             # Plot every 50 episodes
             if episode % 50 == 0:
                 plot_rewards(self)
-
-            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
             # save the best-performing Q-table
             if total_reward > best_reward:
@@ -151,9 +133,6 @@ class SARSA:
                 with open("best_q_table.pkl", "wb") as f:
                     pickle.dump(self.q_table, f)
                 print(f"Best Q-table saved at episode {episode + 1} with reward: {best_reward}")
-
-            self.rewards_history.append(total_reward)
-            self.epsilon_history.append(self.epsilon)
 
             # save Q-table periodically
             if (episode + 1) % save_interval == 0:
@@ -181,7 +160,7 @@ def policy_efficiency(rewards, steps):
 
 def plot_rewards(self, window_size=20):
     """Plots total rewards, moving average, policy efficiency, and epsilon decay."""
-    if len(self.rewards_history) < 10:
+    if len(self.rewards_history) < 20:
         print("Not enough data to plot (need at least 10 episodes).")
         return
 
