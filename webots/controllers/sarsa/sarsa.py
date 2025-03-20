@@ -26,7 +26,7 @@ ACTION_LIMITS = [
 ]
 
 class SARSA:
-    def __init__(self, env, alpha=0.08, gamma=0.99, epsilon=0.7, epsilon_min=0.1, epsilon_decay=0.995):
+    def __init__(self, env, alpha=0.08, gamma=0.99, epsilon=0.7, epsilon_min=0.15, epsilon_decay=0.998):
         self.env = env
         self.alpha = alpha  # learning rate
         self.gamma = gamma  # discount factor
@@ -35,8 +35,9 @@ class SARSA:
         self.epsilon_decay = epsilon_decay  # decay rate
         self.rewards_history = []
         self.epsilon_history = []
+        self.steps_history = []  # TRACK STEPS PER EPISODE
         
-        # discretize state space
+        # Discretized Q-table
         self.q_table = np.zeros(tuple(STATE_BINS) + tuple(ACTION_BINS))
         
         
@@ -83,7 +84,7 @@ class SARSA:
         else:
             return np.unravel_index(np.argmax(self.q_table[state]), (ACTION_BINS[0], ACTION_BINS[1]))
 
-    def train(self, episodes=1000, save_interval=200):
+    def train(self, episodes=500, save_interval=200):
         best_reward = float('-inf')
 
         for episode in range(episodes):
@@ -92,30 +93,55 @@ class SARSA:
             discrete_action = self.choose_action(discrete_state)
 
             total_reward = 0
+            steps = 0  # <== Initialize step counter
             done = False
 
             while not done:
-                # take action A, observe R and S'
                 action = self.undigitize_action(discrete_action)
                 next_state, reward, done = self.env.step(action)
                 total_reward += reward
-
-                # discretize next state and choose next action
-                next_discrete_state = self.discretize_state(next_state)
-                next_discrete_action = self.choose_action(next_discrete_state)
+                steps += 1  # <== Increment step counter
 
                 # SARSA update
+                next_discrete_state = self.discretize_state(next_state)
+                next_discrete_action = self.choose_action(next_discrete_state)
                 q_current = self.q_table[discrete_state][discrete_action]
                 q_next = self.q_table[next_discrete_state][next_discrete_action] if not done else 0
 
-                # Q(S, A) ← Q(S, A) + α[R + γQ(S', A') − Q(S, A)]
                 self.q_table[discrete_state][discrete_action] += self.alpha * (
                     reward + self.gamma * q_next - q_current
                 )
 
-                #move to the next state and action
+                # Move to the next state and action
                 discrete_state = next_discrete_state
                 discrete_action = next_discrete_action
+
+            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+
+            # Save episode metrics
+            self.rewards_history.append(total_reward)
+            self.steps_history.append(steps)  # <== Store steps for this episode
+            self.epsilon_history.append(self.epsilon)
+
+            # Save best-performing Q-table
+            if total_reward > best_reward:
+                best_reward = total_reward
+                with open("best_q_table.pkl", "wb") as f:
+                    pickle.dump(self.q_table, f)
+                print(f"Best Q-table saved at episode {episode + 1} with reward: {best_reward}")
+
+            # Save Q-table periodically
+            if (episode + 1) % save_interval == 0:
+                filename = f"q_table_ep_{episode + 1}.pkl"
+                with open(filename, "wb") as f:
+                    pickle.dump(self.q_table, f)
+                print(f"Q-table saved at episode {episode + 1}")
+
+            print(f"Episode {episode + 1}/{episodes}, Reward: {total_reward}, Steps: {steps}, Epsilon: {self.epsilon:.4f}")
+            
+            # Plot every 50 episodes
+            if episode % 50 == 0:
+                plot_rewards(self)
 
             self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
@@ -140,74 +166,99 @@ class SARSA:
 
         self.plot_rewards()
 
+# Moving Average Function
+def moving_average(data, window_size=20):
+    if len(data) < window_size:
+        return np.array(data)  
+    return np.convolve(data, np.ones(window_size) / window_size, mode='valid')
 
+def policy_efficiency(rewards, steps):
+    """Calculate policy efficiency as avg reward per step, avoiding division by zero."""
+    total_steps = np.sum(steps)
+    if not rewards or not steps or total_steps == 0:
+        return 0  # Avoid division by zero
+    return np.sum(rewards) / max(total_steps, 1)  # Use max to prevent tiny values from causing spikes
 
-    def plot_rewards(self, window_size=20):
-        fig, ax1 = plt.subplots(figsize=(12, 6))
+def plot_rewards(self, window_size=20):
+    """Plots total rewards, moving average, policy efficiency, and epsilon decay."""
+    if len(self.rewards_history) < 10:
+        print("Not enough data to plot (need at least 10 episodes).")
+        return
 
-        # plot rewards
-        color = 'tab:blue'
-        ax1.set_xlabel("Episodes")
-        ax1.set_ylabel("Total Reward", color=color)
-        ax1.plot(self.rewards_history, label="Total Reward", color=color, alpha=0.4)
+    episodes = np.arange(len(self.rewards_history))
 
-        # smoothed rewards
-        if len(self.rewards_history) >= window_size:
-            smoothed_rewards = np.convolve(self.rewards_history, np.ones(window_size) / window_size, mode='valid')
-            ax1.plot(range(window_size - 1, len(self.rewards_history)), smoothed_rewards, color='green',
-                     label="Smoothed Reward", linewidth=2)
+    fig, axes = plt.subplots(3, 1, figsize=(12, 12))
 
-        ax1.tick_params(axis='y', labelcolor=color)
+    # Total rewards per episode
+    axes[0].plot(episodes, self.rewards_history, label="Total Reward", color="blue", alpha=0.6)
+    axes[0].set_title("Total Rewards per Episode")
+    axes[0].set_xlabel("Episodes")
+    axes[0].set_ylabel("Total Reward")
+    axes[0].grid(True, linestyle="--", alpha=0.5)
+    axes[0].legend()
 
-        # Epsilon decay
-        ax2 = ax1.twinx()
-        color = 'tab:orange'
-        ax2.set_ylabel("Epsilon", color=color)
-        ax2.plot(self.epsilon_history, label="Epsilon", color=color, linestyle='dashed')
-        ax2.tick_params(axis='y', labelcolor=color)
+    # Moving average of rewards (window size = 10)
+    if len(self.rewards_history) >= window_size:
+        smoothed_rewards = moving_average(self.rewards_history, window_size)
+        axes[1].plot(range(len(smoothed_rewards)), smoothed_rewards, color="green", linestyle="dashed", linewidth=2, label="Smoothed Reward")
+        axes[1].set_title(f"Moving Average of Rewards ({window_size}-Episode Window)")
+        axes[1].set_xlabel("Episodes")
+        axes[1].set_ylabel("Smoothed Reward")
+        axes[1].grid(True, linestyle="--", alpha=0.5)
+        axes[1].legend()
 
-        plt.title(f"SARSA Training Progress\nAlpha: {self.alpha}, Gamma: {self.gamma}")
-        fig.tight_layout()
+    # Policy efficiency (avg reward per step) - window size = 10
+    if len(self.rewards_history) >= window_size and len(self.steps_history) >= window_size:
+        avg_rewards_per_step = [
+            policy_efficiency(self.rewards_history[max(0, i - window_size):i], self.steps_history[max(0, i - window_size):i])
+            for i in range(window_size, len(self.rewards_history))
+        ]
+        axes[2].plot(range(len(avg_rewards_per_step)), avg_rewards_per_step, color="red", linestyle="solid", linewidth=1.5, label="Policy Efficiency")
+        axes[2].set_title("Policy Efficiency (Avg Reward per Step)")
+        axes[2].set_xlabel("Episodes")
+        axes[2].set_ylabel("Efficiency")
+        axes[2].grid(True, linestyle="--", alpha=0.5)
+        axes[2].legend()
 
-        plt.grid()
-        plt.savefig("rewards_epsilon_plot.png")
-        print("Plot saved as rewards_epsilon_plot.png")
+    plt.tight_layout()
+    plt.savefig("sarsa_training_metrics.png", dpi=300)
+    print("✅ Plots saved as sarsa_training_metrics.png")
 
-            
-    def run(self, q_table_path="best_q_table.pkl", episodes=10):
-        with open(q_table_path, "rb") as f:
-            self.q_table = pickle.load(f)
-        print(f"Loaded Q-table from {q_table_path}")
+        
+def run(self, q_table_path="best_q_table.pkl", episodes=10):
+    with open(q_table_path, "rb") as f:
+        self.q_table = pickle.load(f)
+    print(f"Loaded Q-table from {q_table_path}")
 
-        total_rewards = []
+    total_rewards = []
 
-        for episode in range(1, episodes + 1):
-            state = self.env.reset()
-            discrete_state = self.discretize_state(state)
-            done = False
-            total_reward = 0
-            
-            while not done:
-                action = np.unravel_index(np.argmax(self.q_table[discrete_state]), (ACTION_BINS[0], ACTION_BINS[1]))
-                continuous_action = self.undigitize_action(action)
-                next_state, reward, done = self.env.step(continuous_action)
-                discrete_state = self.discretize_state(next_state)
+    for episode in range(1, episodes + 1):
+        state = self.env.reset()
+        discrete_state = self.discretize_state(state)
+        done = False
+        total_reward = 0
+        
+        while not done:
+            action = np.unravel_index(np.argmax(self.q_table[discrete_state]), (ACTION_BINS[0], ACTION_BINS[1]))
+            continuous_action = self.undigitize_action(action)
+            next_state, reward, done = self.env.step(continuous_action)
+            discrete_state = self.discretize_state(next_state)
 
-                total_reward += reward
+            total_reward += reward
 
-            total_rewards.append(total_reward)
+        total_rewards.append(total_reward)
 
-        avg_reward = np.mean(total_rewards)
-        print(f"\n🔥 Average Reward over {episodes} episodes: {avg_reward:.2f}")
+    avg_reward = np.mean(total_rewards)
+    print(f"\n🔥 Average Reward over {episodes} episodes: {avg_reward:.2f}")
 
-        plt.figure(figsize=(10, 5))
-        plt.plot(range(1, episodes + 1), total_rewards, label="Total Reward per Episode", marker='o')
-        plt.xlabel("Episodes")
-        plt.ylabel("Total Reward")
-        plt.title("Agent Performance Using Best Q-table")
-        plt.grid(True)
-        plt.legend()
-        plt.show()
+    plt.figure(figsize=(10, 5))
+    plt.plot(range(1, episodes + 1), total_rewards, label="Total Reward per Episode", marker='o')
+    plt.xlabel("Episodes")
+    plt.ylabel("Total Reward")
+    plt.title("Agent Performance Using Best Q-table")
+    plt.grid(True)
+    plt.legend()
+    plt.show()
         
         
 env = WebotsCarEnv()
